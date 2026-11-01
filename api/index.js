@@ -10,11 +10,14 @@ const TOTAL_RESPONSE_BUDGET_MS = 4200;
 const GEMINI_TIMEOUT_MS = 3800;
 
 const SYSTEM_PROMPT = [
-  "Ты — полезный голосовой собеседник в навыке Яндекс Алисы, работающий на базе Google Gemini.",
+  "Ты — полезный голосовой собеседник в навыке Яндекс Алисы на базе Google Gemini.",
   "Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.",
   "Обычно используй 1–3 коротких предложения.",
   "Не используй Markdown, таблицы и длинные вступления.",
-  "Учитывай историю диалога и краткую память пользователя.",
+  "Внимательно используй всю переданную историю диалога.",
+  "Если пользователь ранее назвал своё имя, профессию, занятие, интересы или сообщил другие личные факты, учитывай их в последующих ответах.",
+  "Не проси повторно сообщать сведения, которые уже есть в истории.",
+  "Если пользователь спрашивает, что ты о нём помнишь, отвечай на основании истории.",
   "Не выдумывай факты о пользователе.",
   "Если не знаешь ответа, честно скажи об этом."
 ].join(" ");
@@ -64,6 +67,69 @@ function safeHistory(history) {
       role: item.role,
       text: item.text.slice(0, MAX_HISTORY_MESSAGE_CHARS)
     }));
+}
+
+// Объединяет старую память и историю текущей сессии.
+// Учитывает совпадающие сообщения на границе двух массивов.
+function mergeHistory(memoryHistory, sessionHistory) {
+  const memory = safeHistory(memoryHistory);
+  const session = safeHistory(sessionHistory);
+
+  if (!memory.length) return session;
+  if (!session.length) return memory;
+
+  const same = (a, b) =>
+    a.role === b.role && a.text === b.text;
+
+  // Если одна история уже содержит другую целиком,
+  // возвращаем более полную.
+  const containsSequence = (source, sequence) => {
+    if (sequence.length > source.length) return false;
+
+    for (let i = 0; i <= source.length - sequence.length; i++) {
+      if (sequence.every((item, j) => same(item, source[i + j]))) {
+        return true;
+      }
+    }
+
+    return false;
+  };
+
+  if (containsSequence(memory, session)) return memory;
+  if (containsSequence(session, memory)) return session;
+
+  // Ищем пересечение конца старой памяти
+  // с началом новой сессии.
+  let overlap = 0;
+
+  const maxOverlap = Math.min(memory.length, session.length);
+
+  for (let size = 1; size <= maxOverlap; size++) {
+    const left = memory.slice(-size);
+    const right = session.slice(0, size);
+
+    if (left.every((item, i) => same(item, right[i]))) {
+      overlap = size;
+    }
+  }
+
+  const merged = [
+    ...memory,
+    ...session.slice(overlap)
+  ];
+
+  // Удаляем точные дубли, сохраняя порядок.
+  const unique = [];
+
+  for (const item of merged) {
+    const previous = unique[unique.length - 1];
+
+    if (!previous || !same(previous, item)) {
+      unique.push(item);
+    }
+  }
+
+  return unique.slice(-MAX_HISTORY_MESSAGES);
 }
 
 function jsonBytes(value) {
@@ -188,7 +254,8 @@ async function askGemini(text, history, timeoutMs) {
 
     console.info("Gemini stream starting", {
       model,
-      timeoutMs: timeout
+      timeoutMs: timeout,
+      historyMessages: history.length
     });
 
     const response = await fetch(url, {
@@ -263,28 +330,30 @@ async function askGemini(text, history, timeoutMs) {
 
         if (!raw || raw === "[DONE]") continue;
 
+        let data;
+
         try {
-          const data = JSON.parse(raw);
-          const fragment = extractText(data);
+          data = JSON.parse(raw);
+        } catch {
+          console.warn("Gemini SSE: invalid JSON event");
+          continue;
+        }
 
-          if (fragment) {
-            answer += fragment;
+        if (data?.promptFeedback?.blockReason) {
+          throw new Error("GEMINI_BLOCKED");
+        }
 
-            if (!firstTokenLogged) {
-              firstTokenLogged = true;
+        const fragment = extractText(data);
 
-              console.info("Gemini first text received", {
-                elapsedMs: Date.now() - startedAt
-              });
-            }
-          }
+        if (fragment) {
+          answer += fragment;
 
-          if (data?.promptFeedback?.blockReason) {
-            throw new Error("GEMINI_BLOCKED");
-          }
-        } catch (error) {
-          if (error?.message === "GEMINI_BLOCKED") {
-            throw error;
+          if (!firstTokenLogged) {
+            firstTokenLogged = true;
+
+            console.info("Gemini first text received", {
+              elapsedMs: Date.now() - startedAt
+            });
           }
         }
       }
@@ -342,10 +411,6 @@ async function askGemini(text, history, timeoutMs) {
 
     return finalAnswer;
   } catch (error) {
-    if (answerFromError(error)) {
-      return answerFromError(error);
-    }
-
     if (controller.signal.aborted || error?.name === "AbortError") {
       console.warn("Gemini stream timeout", {
         elapsedMs: Date.now() - startedAt
@@ -362,12 +427,6 @@ async function askGemini(text, history, timeoutMs) {
       await reader.cancel().catch(() => {});
     }
   }
-}
-
-function answerFromError(error) {
-  return typeof error?.partialAnswer === "string"
-    ? error.partialAnswer.trim()
-    : "";
 }
 
 function errorForUser(error) {
@@ -444,11 +503,23 @@ export default async function handler(req, res) {
     body?.state?.user?.memory?.history
   );
 
-  const oldHistory = sessionHistory.length
-    ? sessionHistory
-    : savedMemory;
+  // Главное исправление:
+  // используем одновременно историю сессии и память пользователя.
+  const oldHistory = mergeHistory(
+    savedMemory,
+    sessionHistory
+  );
+
+  console.info("Alice state received", {
+    sessionMessages: sessionHistory.length,
+    memoryMessages: savedMemory.length,
+    mergedMessages: oldHistory.length,
+    userIdPresent: Boolean(body?.session?.user?.user_id)
+  });
 
   if (isClearMemoryCommand(text)) {
+    console.info("Alice memory clear requested");
+
     return res.status(200).json(
       aliceResponse(
         "Хорошо, я очистила сохранённую память. Начнём заново!",
@@ -497,7 +568,9 @@ export default async function handler(req, res) {
     ]);
 
     console.info("Alice response ready", {
-      elapsedMs: Date.now() - startedAt
+      elapsedMs: Date.now() - startedAt,
+      historyMessages: history.length,
+      memoryUpdate: true
     });
 
     return res.status(200).json(
@@ -532,5 +605,6 @@ export {
   compactMemory,
   fitAliceText,
   fitHistoryToState,
+  mergeHistory,
   safeHistory
 };
